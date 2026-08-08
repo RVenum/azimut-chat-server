@@ -1,6 +1,7 @@
 from flask import Flask, request
 from flask_socketio import SocketIO, emit, join_room, leave_room
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import inspect
 from datetime import datetime
 import os
 
@@ -19,8 +20,8 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 class ChatRoom(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(150), unique=True, nullable=False)
-    user1 = db.Column(db.String(100), nullable=True)   # первый участник (для приватных)
-    user2 = db.Column(db.String(100), nullable=True)   # второй участник
+    user1 = db.Column(db.String(100), nullable=True)
+    user2 = db.Column(db.String(100), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 class Message(db.Model):
@@ -41,10 +42,23 @@ class Message(db.Model):
             'timestamp': int(self.timestamp.timestamp() * 1000)
         }
 
-# Инициализация
+# ---------- Инициализация и авто-миграция ----------
 with app.app_context():
+    # Проверяем, существуют ли уже таблицы
     db.create_all()
 
+    inspector = inspect(db.engine)
+    # Если таблица chat_room существует, но без колонки user1 – значит она старого образца
+    if 'chat_room' in inspector.get_table_names():
+        columns = [col['name'] for col in inspector.get_columns('chat_room')]
+        if 'user1' not in columns:
+            print("Обнаружена старая структура chat_room. Удаляю и пересоздаю...")
+            # Удаляем таблицу вместе с зависимостями (CASCADE уберёт и foreign key)
+            db.engine.execute('DROP TABLE IF EXISTS chat_room CASCADE')
+            db.create_all()  # создаст заново с новыми колонками
+            print("chat_room пересоздана.")
+
+    # Добавляем стандартные комнаты, если их нет
     DEFAULT_ROOMS = [
         "Штаб", "Дежурная смена", "Альпинисты", "Медики", "ПСР",
         "Тренировки", "Водители", "Связисты", "Кинологи", "Водолазы",
@@ -115,19 +129,16 @@ def handle_create_private(data):
     users = sorted([user1, user2])
     room_name = f"private_{users[0]}_{users[1]}"
 
-    # Если комната уже существует, просто возвращаем её
     existing = ChatRoom.query.filter_by(name=room_name).first()
     if existing:
         emit('private_created', {'room': room_name}, room=request.sid)
         return
 
-    # Создаём новую приватную комнату
     room = ChatRoom(name=room_name, user1=users[0], user2=users[1])
     db.session.add(room)
     db.session.commit()
 
     emit('private_created', {'room': room_name}, room=request.sid)
-    # Оповещаем второго участника (если он онлайн) — всем рассылаем, клиент сам разберётся
     socketio.emit('private_created', {'room': room_name})
 
 @socketio.on('get_rooms')
@@ -137,9 +148,7 @@ def handle_get_rooms():
 
 @socketio.on('get_users')
 def handle_get_users():
-    # Собираем всех, кто хоть раз отправлял сообщения (для простоты)
     users = [row[0] for row in db.session.query(Message.username).distinct().all()]
-    # Исключаем системного пользователя
     users = [u for u in users if u != 'Система']
     emit('users_list', {'users': users})
 
