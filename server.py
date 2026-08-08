@@ -112,6 +112,7 @@ def handle_chat_message(data):
     msg = Message(room=room, username=username, text=text, type='user')
     db.session.add(msg)
     db.session.commit()
+    print(f'New message in {room}: {text}')  # Отладка
     emit('message', msg.to_dict(), room=room)
 
 @socketio.on('create_private')
@@ -135,20 +136,22 @@ def handle_create_private(data):
 
 @socketio.on('get_rooms')
 def handle_get_rooms(data=None):
+    print('get_rooms called')  # Отладка
     all_rooms = ChatRoom.query.order_by(ChatRoom.created_at).all()
     rooms_info = []
     for r in all_rooms:
-        # Получаем последнее сообщение для комнаты
         last_msg = Message.query.filter_by(room=r.name)\
             .order_by(Message.timestamp.desc()).first()
         last_text = last_msg.text if last_msg else ''
         last_time = last_msg.timestamp.isoformat() if last_msg else None
+        print(f'Room {r.name}: last_text={last_text}')  # Отладка
         rooms_info.append({
             'name': r.name,
             'lastMessage': last_text,
             'lastTime': last_time,
-            'unread': 0   # Пока 0, добавим позже
+            'unread': 0
         })
+    print(f'Sending rooms_list: {rooms_info[0] if rooms_info else "empty"}')  # Отладка
     emit('rooms_list', {'rooms': rooms_info})
 
 @socketio.on('get_users')
