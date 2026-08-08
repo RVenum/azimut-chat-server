@@ -143,7 +143,7 @@ def handle_get_rooms(data=None):
         last_msg = Message.query.filter_by(room=r.name)\
             .order_by(Message.timestamp.desc()).first()
         last_text = last_msg.text if last_msg else ''
-        last_time = last_msg.timestamp.isoformat() if last_msg else None
+        last_time = last_msg.timestamp.isoformat() + 'Z' if last_msg else None
         print(f'Room {r.name}: last_text={last_text}')  # Отладка
         rooms_info.append({
             'name': r.name,
