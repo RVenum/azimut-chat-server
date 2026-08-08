@@ -1,26 +1,62 @@
-import pymysql
 from flask import Flask, request
 from flask_socketio import SocketIO, emit, join_room, leave_room
+from flask_sqlalchemy import SQLAlchemy
+from datetime import datetime
+import os
 import time
 
 app = Flask(__name__)
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'change-me-in-production')
+# Берём строку подключения из переменной окружения Render
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get(
+    'DATABASE_URL',
+    'sqlite:///chat.db'   # fallback для локальной разработки
+)
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+db = SQLAlchemy(app)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
-# --- Настройки подключения к MySQL ---
-DB_HOST = 'localhost'
-DB_USER = 'ваш_пользователь'
-DB_PASS = 'ваш_пароль'
-DB_NAME = 'ваша_база_данных'
+# ------------------- Модели -------------------
+class ChatRoom(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(150), unique=True, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
-def get_db():
-    return pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASS, database=DB_NAME, charset='utf8mb4')
+class Message(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    room = db.Column(db.String(150), db.ForeignKey('chat_room.name'), nullable=False, index=True)
+    username = db.Column(db.String(100), nullable=False)
+    text = db.Column(db.Text, nullable=False)
+    type = db.Column(db.String(20), default='user')  # 'user' или 'system'
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
 
-DEFAULT_ROOMS = [
-    "Штаб", "Дежурная смена", "Альпинисты", "Медики", "ПСР",
-    "Тренировки", "Водители", "Связисты", "Кинологи", "Водолазы",
-    "Резерв", "Общий сбор", "Отдых", "Махачкала-центр", "Аэропорт"
-]
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'room': self.room,
+            'username': self.username,
+            'text': self.text,
+            'type': self.type,
+            'timestamp': int(self.timestamp.timestamp() * 1000)  # клиент ждёт число
+        }
 
+# ---------- Инициализация базы и стандартных комнат ----------
+with app.app_context():
+    db.create_all()
+
+    DEFAULT_ROOMS = [
+        "Штаб", "Дежурная смена", "Альпинисты", "Медики", "ПСР",
+        "Тренировки", "Водители", "Связисты", "Кинологи", "Водолазы",
+        "Резерв", "Общий сбор", "Отдых", "Махачкала-центр", "Аэропорт"
+    ]
+
+    for room_name in DEFAULT_ROOMS:
+        if not ChatRoom.query.filter_by(name=room_name).first():
+            db.session.add(ChatRoom(name=room_name))
+    db.session.commit()
+
+# ------------------- События Socket.IO -------------------
 @socketio.on('connect')
 def handle_connect():
     print(f'Client connected: {request.sid}')
@@ -29,49 +65,36 @@ def handle_connect():
 def on_join(data):
     room = data.get('room', '')
     username = data.get('username', 'Гость')
-    if room:
-        join_room(room)
-        # Отправляем последние 50 сообщений комнаты
-        try:
-            db = get_db()
-            cur = db.cursor()
-            cur.execute("SELECT username, message, timestamp FROM chat_messages WHERE room_name=%s ORDER BY timestamp DESC LIMIT 50", (room,))
-            rows = cur.fetchall()
-            history = []
-            for u, msg, ts in reversed(list(rows)):
-                history.append({
-                    'type': 'user',
-                    'username': u,
-                    'text': msg,
-                    'room': room,
-                    'timestamp': ts
-                })
-            db.close()
-            emit('history', {'messages': history}, room=request.sid)
-        except Exception as e:
-            print('Ошибка загрузки истории:', e)
-        # Системное сообщение
-        sys_msg = {
-            'type': 'system',
-            'text': f'{username} присоединился',
-            'room': room,
-            'timestamp': int(time.time() * 1000)
-        }
-        emit('message', sys_msg, room=room)
+    if not room:
+        return
+
+    join_room(room)
+
+    # Отправляем историю последних 100 сообщений комнаты
+    history = Message.query.filter_by(room=room)\
+        .order_by(Message.timestamp.asc()).limit(100).all()
+    emit('history', {'messages': [msg.to_dict() for msg in history]})
+
+    # Сохраняем и рассылаем системное сообщение
+    sys_msg = Message(room=room, username='Система',
+                      text=f'{username} присоединился', type='system')
+    db.session.add(sys_msg)
+    db.session.commit()
+    emit('message', sys_msg.to_dict(), room=room)
 
 @socketio.on('leave')
 def on_leave(data):
     room = data.get('room', '')
     username = data.get('username', 'Гость')
-    if room:
-        leave_room(room)
-        sys_msg = {
-            'type': 'system',
-            'text': f'{username} покинул комнату',
-            'room': room,
-            'timestamp': int(time.time() * 1000)
-        }
-        emit('message', sys_msg, room=room)
+    if not room:
+        return
+
+    leave_room(room)
+    sys_msg = Message(room=room, username='Система',
+                      text=f'{username} покинул комнату', type='system')
+    db.session.add(sys_msg)
+    db.session.commit()
+    emit('message', sys_msg.to_dict(), room=room)
 
 @socketio.on('chat_message')
 def handle_chat_message(data):
@@ -80,58 +103,35 @@ def handle_chat_message(data):
     text = data.get('text', '')
     if not room or not text:
         return
-    ts = int(time.time() * 1000)
-    msg = {
-        'type': 'user',
-        'username': username,
-        'text': text,
-        'room': room,
-        'timestamp': ts
-    }
-    emit('message', msg, room=room)
 
-    # Сохраняем в БД
-    try:
-        db = get_db()
-        cur = db.cursor()
-        cur.execute("INSERT INTO chat_messages (room_name, username, message, timestamp) VALUES (%s,%s,%s,%s)",
-                    (room, username, text, ts))
-        db.commit()
-        db.close()
-    except Exception as e:
-        print('Ошибка сохранения сообщения:', e)
+    msg = Message(room=room, username=username, text=text, type='user')
+    db.session.add(msg)
+    db.session.commit()
+    emit('message', msg.to_dict(), room=room)
 
 @socketio.on('create_private')
 def handle_create_private(data):
     user1 = data.get('user1', '')
     user2 = data.get('user2', '')
-    if user1 and user2:
-        users = sorted([user1, user2])
-        room_name = f"private_{users[0]}_{users[1]}"
-        # Добавляем комнату в БД, если ещё нет
-        try:
-            db = get_db()
-            cur = db.cursor()
-            cur.execute("INSERT IGNORE INTO chat_rooms (name, type, created_by) VALUES (%s, 'private', %s)", (room_name, user1))
-            db.commit()
-            db.close()
-        except Exception as e:
-            print('Ошибка создания приватной комнаты:', e)
-        emit('private_created', {'room': room_name}, room=request.sid)
-        socketio.emit('private_created', {'room': room_name})
+    if not user1 or not user2:
+        return
+
+    users = sorted([user1, user2])
+    room_name = f"private_{users[0]}_{users[1]}"
+
+    if not ChatRoom.query.filter_by(name=room_name).first():
+        db.session.add(ChatRoom(name=room_name))
+        db.session.commit()
+
+    emit('private_created', {'room': room_name}, room=request.sid)
+    socketio.emit('private_created', {'room': room_name})
 
 @socketio.on('get_rooms')
 def handle_get_rooms():
-    try:
-        db = get_db()
-        cur = db.cursor()
-        cur.execute("SELECT name FROM chat_rooms ORDER BY created_at")
-        rows = cur.fetchall()
-        rooms = [r[0] for r in rows]
-        db.close()
-    except Exception:
-        rooms = DEFAULT_ROOMS + []  # если БД недоступна, отдаём стандартный список
+    rooms = [r.name for r in ChatRoom.query.order_by(ChatRoom.created_at).all()]
     emit('rooms_list', {'rooms': rooms})
 
+# ------------------- Запуск -------------------
 if __name__ == '__main__':
-    socketio.run(app, host='0.0.0.0', port=10000, debug=False, allow_unsafe_werkzeug=True)
+    port = int(os.environ.get('PORT', 10000))
+    socketio.run(app, host='0.0.0.0', port=port, debug=False, allow_unsafe_werkzeug=True)
