@@ -1,7 +1,7 @@
 from flask import Flask, request
 from flask_socketio import SocketIO, emit, join_room, leave_room
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import inspect, text, func
+from sqlalchemy import inspect, text
 from datetime import datetime
 import os
 
@@ -42,13 +42,6 @@ class Message(db.Model):
             'timestamp': int(self.timestamp.timestamp() * 1000)
         }
 
-class UserRoomRead(db.Model):
-    """Время последнего прочитанного сообщения пользователем в комнате."""
-    id = db.Column(db.Integer, primary_key=True)
-    username = db.Column(db.String(100), nullable=False)
-    room = db.Column(db.String(150), nullable=False)
-    last_read = db.Column(db.DateTime, default=datetime.utcnow)
-
 # ---------- Инициализация ----------
 with app.app_context():
     db.create_all()
@@ -73,22 +66,6 @@ with app.app_context():
             db.session.add(ChatRoom(name=room_name))
     db.session.commit()
 
-# ---------- Вспомогательные функции ----------
-def get_unread_count(room, username):
-    """Количество непрочитанных сообщений (не своих) после last_read."""
-    last_rec = UserRoomRead.query.filter_by(username=username, room=room).first()
-    if last_rec:
-        return Message.query.filter(
-            Message.room == room,
-            Message.timestamp > last_rec.last_read,
-            Message.username != username
-        ).count()
-    else:
-        return Message.query.filter(
-            Message.room == room,
-            Message.username != username
-        ).count()
-
 # ------------------- События Socket.IO -------------------
 @socketio.on('connect')
 def handle_connect():
@@ -101,15 +78,6 @@ def on_join(data):
     if not room:
         return
     join_room(room)
-
-    # Обновляем время последнего прочитанного
-    now = datetime.utcnow()
-    rec = UserRoomRead.query.filter_by(username=username, room=room).first()
-    if rec:
-        rec.last_read = now
-    else:
-        db.session.add(UserRoomRead(username=username, room=room, last_read=now))
-    db.session.commit()
 
     history = Message.query.filter_by(room=room)\
         .order_by(Message.timestamp.asc()).limit(100).all()
@@ -167,20 +135,19 @@ def handle_create_private(data):
 
 @socketio.on('get_rooms')
 def handle_get_rooms(data=None):
-    username = data.get('username') if data else None
     all_rooms = ChatRoom.query.order_by(ChatRoom.created_at).all()
     rooms_info = []
     for r in all_rooms:
+        # Получаем последнее сообщение для комнаты
         last_msg = Message.query.filter_by(room=r.name)\
             .order_by(Message.timestamp.desc()).first()
-        last_message = last_msg.text if last_msg else ''
+        last_text = last_msg.text if last_msg else ''
         last_time = last_msg.timestamp.isoformat() if last_msg else None
-        unread = get_unread_count(r.name, username) if username else 0
         rooms_info.append({
             'name': r.name,
-            'lastMessage': last_message,
+            'lastMessage': last_text,
             'lastTime': last_time,
-            'unread': unread
+            'unread': 0   # Пока 0, добавим позже
         })
     emit('rooms_list', {'rooms': rooms_info})
 
