@@ -1,1 +1,0 @@
-# azimut-chat-server
