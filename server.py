@@ -1,7 +1,7 @@
 from flask import Flask, request
 from flask_socketio import SocketIO, emit, join_room, leave_room
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import inspect
+from sqlalchemy import inspect, text   # добавлен text
 from datetime import datetime
 import os
 
@@ -44,21 +44,20 @@ class Message(db.Model):
 
 # ---------- Инициализация и авто-миграция ----------
 with app.app_context():
-    # Проверяем, существуют ли уже таблицы
     db.create_all()
 
     inspector = inspect(db.engine)
-    # Если таблица chat_room существует, но без колонки user1 – значит она старого образца
     if 'chat_room' in inspector.get_table_names():
         columns = [col['name'] for col in inspector.get_columns('chat_room')]
         if 'user1' not in columns:
             print("Обнаружена старая структура chat_room. Удаляю и пересоздаю...")
-            # Удаляем таблицу вместе с зависимостями (CASCADE уберёт и foreign key)
-            db.engine.execute('DROP TABLE IF EXISTS chat_room CASCADE')
-            db.create_all()  # создаст заново с новыми колонками
+            # Выполняем через соединение
+            with db.engine.connect() as conn:
+                conn.execute(text('DROP TABLE IF EXISTS chat_room CASCADE'))
+                conn.commit()
+            db.create_all()
             print("chat_room пересоздана.")
 
-    # Добавляем стандартные комнаты, если их нет
     DEFAULT_ROOMS = [
         "Штаб", "Дежурная смена", "Альпинисты", "Медики", "ПСР",
         "Тренировки", "Водители", "Связисты", "Кинологи", "Водолазы",
